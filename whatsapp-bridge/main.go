@@ -81,6 +81,8 @@ func NewMessageStore() (*MessageStore, error) {
 			file_sha256 BLOB,
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
+			quoted_message_id TEXT,
+			quoted_sender TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -88,6 +90,31 @@ func NewMessageStore() (*MessageStore, error) {
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
+	}
+
+	// Migrate databases created before the quoted-message columns were added.
+	// SQLite has no ADD COLUMN IF NOT EXISTS, so check the schema first.
+	existing := map[string]bool{}
+	rows, err := db.Query("PRAGMA table_info(messages)")
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var cid int
+			var name, ctype string
+			var notnull, pk int
+			var dflt sql.NullString
+			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err == nil {
+				existing[name] = true
+			}
+		}
+	}
+	for _, col := range []string{"quoted_message_id", "quoted_sender"} {
+		if !existing[col] {
+			if _, err := db.Exec("ALTER TABLE messages ADD COLUMN " + col + " TEXT"); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("failed to add column %s: %v", col, err)
+			}
+		}
 	}
 
 	return &MessageStore{db: db}, nil
@@ -100,8 +127,12 @@ func (store *MessageStore) Close() error {
 
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
+	// Upsert: an empty name (e.g. outgoing message) must not overwrite a known name.
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		ON CONFLICT(jid) DO UPDATE SET
+			name = COALESCE(NULLIF(excluded.name, ''), chats.name),
+			last_message_time = excluded.last_message_time`,
 		jid, name, lastMessageTime,
 	)
 	return err
@@ -109,17 +140,20 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
-	// Only store if there's actual content or media
-	if content == "" && mediaType == "" {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	quotedMessageID, quotedSender string) error {
+	// Only store if there's actual content, media, or a quoted message.
+	// A reply with empty text still carries information through its quote.
+	if content == "" && mediaType == "" && quotedMessageID == "" {
 		return nil
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id, quoted_sender)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		quotedMessageID, quotedSender,
 	)
 	return err
 }
@@ -189,6 +223,34 @@ func extractTextContent(msg *waProto.Message) string {
 	return ""
 }
 
+// Extract the quoted (replied-to) message reference, if any.
+// WhatsApp carries it in the ContextInfo of each message type; returns the
+// quoted message ID and its author.
+func extractQuotedInfo(msg *waProto.Message) (quotedID string, quotedSender string) {
+	if msg == nil {
+		return "", ""
+	}
+
+	var ctx *waProto.ContextInfo
+	switch {
+	case msg.GetExtendedTextMessage() != nil:
+		ctx = msg.GetExtendedTextMessage().GetContextInfo()
+	case msg.GetImageMessage() != nil:
+		ctx = msg.GetImageMessage().GetContextInfo()
+	case msg.GetVideoMessage() != nil:
+		ctx = msg.GetVideoMessage().GetContextInfo()
+	case msg.GetAudioMessage() != nil:
+		ctx = msg.GetAudioMessage().GetContextInfo()
+	case msg.GetDocumentMessage() != nil:
+		ctx = msg.GetDocumentMessage().GetContextInfo()
+	}
+
+	if ctx == nil || ctx.GetStanzaID() == "" {
+		return "", ""
+	}
+	return ctx.GetStanzaID(), ctx.GetParticipant()
+}
+
 // SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
@@ -203,7 +265,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -211,6 +273,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	// Create JID for recipient
 	var recipientJID types.JID
 	var err error
+
+	// Media type and upload info to record in the database once the message is sent.
+	var sentMediaType string
+	var uploaded whatsmeow.UploadResponse
 
 	// Check if recipient is a JID
 	isJID := strings.Contains(recipient, "@")
@@ -289,6 +355,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		}
 
 		fmt.Println("Media uploaded", resp)
+		uploaded = resp
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -357,15 +424,68 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 				FileLength:    &resp.FileLength,
 			}
 		}
+
+		// Media label, matching the one produced by extractMediaInfo on receipt.
+		switch mediaType {
+		case whatsmeow.MediaImage:
+			sentMediaType = "image"
+		case whatsmeow.MediaAudio:
+			sentMediaType = "audio"
+		case whatsmeow.MediaVideo:
+			sentMediaType = "video"
+		case whatsmeow.MediaDocument:
+			sentMediaType = "document"
+		}
 	} else {
 		msg.Conversation = proto.String(message)
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// Store the outgoing message: whatsmeow emits no event for messages sent
+	// through the API, so they would otherwise never reach the database.
+	if messageStore != nil {
+		// Incoming messages from a contact known by its LID are stored under
+		// xxx@lid: store the outgoing one there too so the conversation isn't split.
+		storeJID := recipientJID
+		if recipientJID.Server == types.DefaultUserServer && client.Store != nil && client.Store.LIDs != nil {
+			if lid, err := client.Store.LIDs.GetLIDForPN(context.Background(), recipientJID); err == nil && !lid.IsEmpty() {
+				storeJID = lid
+			}
+		}
+		chatJID := storeJID.String()
+		var sender string
+		if client.Store != nil && client.Store.ID != nil {
+			sender = client.Store.ID.User
+		}
+
+		storedContent := message
+		storedMediaType := ""
+		storedFilename := ""
+		if mediaPath != "" {
+			storedMediaType = sentMediaType
+			storedFilename = filepath.Base(mediaPath)
+			// Audio messages have no caption, so the text was never sent.
+			if sentMediaType == "audio" {
+				storedContent = ""
+			}
+		}
+
+		if err := messageStore.StoreChat(chatJID, "", resp.Timestamp); err != nil {
+			fmt.Printf("Warning: failed to store chat for outgoing message: %v\n", err)
+		}
+		if err := messageStore.StoreMessage(
+			resp.ID, chatJID, sender, storedContent, resp.Timestamp, true,
+			storedMediaType, storedFilename, uploaded.URL, uploaded.MediaKey,
+			uploaded.FileSHA256, uploaded.FileEncSHA256, uploaded.FileLength, "", "",
+		); err != nil {
+			fmt.Printf("Warning: failed to store outgoing message: %v\n", err)
+		}
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -429,8 +549,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
-	// Skip if there's no content and no media
-	if content == "" && mediaType == "" {
+	// Extract quoted message reference
+	quotedID, quotedSender := extractQuotedInfo(msg.Message)
+
+	// Skip if there's no content, no media and no quoted message
+	if content == "" && mediaType == "" && quotedID == "" {
 		return
 	}
 
@@ -449,6 +572,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedID,
+		quotedSender,
 	)
 
 	if err != nil {
@@ -641,7 +766,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -706,7 +831,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -800,14 +925,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +1098,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1113,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1063,6 +1188,12 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					}
 				}
 
+				// Extract quoted message reference
+				var quotedID, quotedSender string
+				if msg.Message.Message != nil {
+					quotedID, quotedSender = extractQuotedInfo(msg.Message.Message)
+				}
+
 				// Extract media info
 				var mediaType, filename, url string
 				var mediaKey, fileSHA256, fileEncSHA256 []byte
@@ -1126,6 +1257,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					quotedID,
+					quotedSender,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
